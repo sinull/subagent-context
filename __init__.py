@@ -41,8 +41,8 @@ __all__ = ["register", "on_pre_llm_call", "on_pre_tool_call"]
 
 INJECT_HEADER = "[parent-agent context digest]"
 
-_DEFAULT_BUDGET = 6000
-_DEFAULT_TAIL = 30
+_DEFAULT_BUDGET = 6000000
+_DEFAULT_TAIL = 3000
 _MAX_SESSIONS = 64  # bounded memory; FIFO eviction beyond this
 
 _lock = threading.Lock()
