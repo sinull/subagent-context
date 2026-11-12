@@ -31,13 +31,21 @@ assistant: …
 (模型原本填写的 context,如有)
 ```
 
-## 配置(环境变量)
+## 配置(环境变量,写入 `<HERMES_HOME>\.env`)
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `SUBAGENT_CONTEXT_BUDGET` | 6000 | 每个任务注入的摘要字符上限 |
-| `SUBAGENT_CONTEXT_TAIL` | 30 | 参与摘要的父会话消息条数上限 |
+| `SUBAGENT_CONTEXT_MODE` | `digest` | **`full` = 全量继承**:所有消息(含工具结果)、不截断、不限条数 |
+| `SUBAGENT_CONTEXT_MAX_CHARS` | 200000 | full 模式安全钳位(字符);`0` = 真·无限(不建议,见下) |
+| `SUBAGENT_CONTEXT_BUDGET` | 6000 | digest 模式每任务注入的摘要字符上限 |
+| `SUBAGENT_CONTEXT_TAIL` | 30 | digest 模式参与摘要的父会话消息条数上限 |
 | `SUBAGENT_CONTEXT_DISABLE` | 未设 | 设为 `1` 即整体停用(逃生门) |
+
+### full 模式的钳位为什么必须有
+
+已核实 v0.23.1 源码:`delegate_task` 的 `context` 字段**没有字符上限**(16k/32k 上限只约束插件生命周期 API)。真正的天花板是**子代理模型的上下文窗口**——而子代理的第一条消息(context+goal)在它自己的上下文压缩中是**逐字保留**的,塞超了就无解。默认 20 万字符 ≈ 5 万 token,128k 窗口的子模型留足工作空间。超钳位时从**最旧端**丢弃并标注省略量(保留最近的上下文)。若你的子模型是长上下文(200k+ token),可自行调大或设 `0`。
+
+full 模式的代价:每个子代理都要为完整父历史付输入 token(批量×N 个任务;同批兄弟因共享前缀可吃 prompt cache);父会话很长时,一次 10 任务批量 = 10 份全量上下文的费用。
 
 ## 设计取舍与已知边界
 

@@ -1,31 +1,42 @@
-"""subagent-context — make `delegate_task` children inherit (a bounded digest of)
-the parent agent's conversation context by default.
+"""subagent-context — make `delegate_task` children inherit the parent agent's
+conversation context by default.
 
-Hermes subagents start with a completely fresh conversation ("Subagents Know
-Nothing"): their only task context is the `goal`/`context` fields the parent
-model fills in. This plugin closes that gap mechanically instead of hoping the
-model writes good context.
+Two rendering modes, selected by ``SUBAGENT_CONTEXT_MODE``:
+
+``digest`` (default)
+    A bounded digest: last N user/assistant messages, truncated to a char
+    budget. Cheap, predictable, ignores tool noise.
+
+``full``
+    Everything: every message of the parent conversation (user, assistant and
+    tool results), untruncated, no tail limit — optionally clamped by
+    ``SUBAGENT_CONTEXT_MAX_CHARS`` (default 200,000; ``0`` = truly unlimited).
+    The clamp exists because the child's first message is kept verbatim through
+    its context compression, so an oversized injection can wedge the child
+    against its model's context window with no way to compact it away.
 
 Mechanism (public, documented plugin surfaces only — no core patching):
 
   * ``pre_llm_call`` fires before the tool loop of each user turn with the
-    parent's ``conversation_history``. We render a bounded text digest of that
-    history and remember it per ``session_id``.
+    parent's ``conversation_history`` (all prior turns + the current user
+    message). We render it to text and remember it per ``session_id``.
   * ``pre_tool_call`` fires before each tool dispatch with ``(tool_name,
     args)``. When the tool is ``delegate_task`` we return
     ``{"action": "modify", "args": {...}}`` — the documented arg-rewrite
-    return — to prepend the parent digest to the call's ``context`` field
-    (both the single-task form and every task in the batch ``tasks`` form).
+    return — to prepend the rendered parent context to the call's ``context``
+    field (single-task and batch ``tasks`` forms).
 
-The digest is placed *before* the model-written task context so all tasks of
-one batch share an identical message prefix and siblings can still read each
-other's prompt cache.
+The rendered context is placed *before* the model-written task context so all
+tasks of one batch share an identical message prefix and siblings can still
+read each other's prompt cache.
 
 Configuration (environment variables, read at call time):
 
-  SUBAGENT_CONTEXT_BUDGET   max chars of parent digest per task (default 6000)
-  SUBAGENT_CONTEXT_TAIL     max parent messages considered     (default 30)
-  SUBAGENT_CONTEXT_DISABLE  "1"/"true"/"yes" makes the plugin a no-op
+  SUBAGENT_CONTEXT_MODE        digest (default) | full
+  SUBAGENT_CONTEXT_MAX_CHARS   full-mode safety clamp, chars (default 200000; 0 = unlimited)
+  SUBAGENT_CONTEXT_BUDGET      digest-mode char budget (default 6000)
+  SUBAGENT_CONTEXT_TAIL        digest-mode parent message count (default 30)
+  SUBAGENT_CONTEXT_DISABLE     "1"/"true"/"yes" makes the plugin a no-op
 
 Both hook callbacks are pure string operations (no I/O, no LLM calls) so they
 finish far inside the default 30 s ``hook_callback_timeout`` — important
@@ -41,42 +52,64 @@ __all__ = ["register", "on_pre_llm_call", "on_pre_tool_call"]
 
 INJECT_HEADER = "[parent-agent context digest]"
 
-_DEFAULT_BUDGET = 6000000
-_DEFAULT_TAIL = 3000
+# digest mode
+_DEFAULT_BUDGET = 6000
+_DEFAULT_TAIL = 30
+# full mode: ~50k tokens on a 128k-token child model, leaving room to work.
+# The child's first message is protected from its own context compression, so
+# this clamp is the only thing keeping an oversized injection from wedging the
+# child against the model's context window.
+_DEFAULT_FULL_MAX_CHARS = 200_000
 _MAX_SESSIONS = 64  # bounded memory; FIFO eviction beyond this
 
 _lock = threading.Lock()
-_digests: dict[str, str] = {}  # session_id -> digest built at turn start
+_digests: dict[str, str] = {}  # session_id -> rendered context, built per turn
 
 
 # --------------------------------------------------------------------------
 # configuration helpers
 # --------------------------------------------------------------------------
 
+def _env_raw(name: str) -> str:
+    return os.environ.get(name, "").strip()
+
+
 def _env_int(name: str, default: int, floor: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
+    raw = _env_raw(name)
+    if not raw:
         return default
     try:
-        return max(floor, int(raw.strip()))
+        return max(floor, int(raw))
     except ValueError:
         return default
 
 
-def _budget() -> int:
+def _mode() -> str:
+    value = _env_raw("SUBAGENT_CONTEXT_MODE").lower()
+    return value if value in ("digest", "full") else "digest"
+
+
+def _budget() -> int:  # digest mode only
     return _env_int("SUBAGENT_CONTEXT_BUDGET", _DEFAULT_BUDGET, 500)
 
 
-def _tail() -> int:
+def _tail() -> int:  # digest mode only
     return _env_int("SUBAGENT_CONTEXT_TAIL", _DEFAULT_TAIL, 1)
 
 
+def _full_max_chars() -> int:
+    """Full-mode clamp. ``0`` = unlimited (explicitly accepted risk)."""
+    raw = _env_raw("SUBAGENT_CONTEXT_MAX_CHARS")
+    if not raw:
+        return _DEFAULT_FULL_MAX_CHARS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_FULL_MAX_CHARS
+
+
 def _disabled() -> bool:
-    return os.environ.get("SUBAGENT_CONTEXT_DISABLE", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    return _env_raw("SUBAGENT_CONTEXT_DISABLE").lower() in ("1", "true", "yes")
 
 
 # --------------------------------------------------------------------------
@@ -116,12 +149,8 @@ def _text_of(content) -> str:
     return str(content)
 
 
-def _build_digest(history, budget: int) -> str:
-    """Render the tail of the parent conversation into at most ``budget`` chars.
-
-    Only user / assistant messages are kept — raw tool chatter and results are
-    noise for a child and would burn its fresh context for nothing.
-    """
+def _render_digest(history, budget: int) -> str:
+    """Bounded digest: user/assistant messages only, tail-capped, truncated."""
     if not history:
         return ""
 
@@ -156,6 +185,38 @@ def _build_digest(history, budget: int) -> str:
     return "\n".join(lines)[:budget]
 
 
+def _render_full(history, clamp: int) -> str:
+    """Everything: every role (user / assistant / tool results), untruncated.
+
+    When the result exceeds ``clamp``, drop from the FRONT (recency matters)
+    and say how much was omitted. ``clamp == 0`` disables the clamp entirely.
+    """
+    if not history:
+        return ""
+
+    lines: list[str] = []
+    for msg in history:
+        role = _role_of(msg)
+        text = _text_of(_content_of(msg)).strip()
+        if not text:
+            continue
+        if role == "user" and INJECT_HEADER in text:
+            continue  # never re-embed a boomeranged injection
+        lines.append(f"{role}: {text}")
+
+    body = "\n".join(lines)
+    if clamp and len(body) > clamp:
+        omitted = len(body) - clamp
+        body = f"(older parent context omitted: {omitted:,} chars)\n" + body[-clamp:]
+    return body
+
+
+def _render(history) -> str:
+    if _mode() == "full":
+        return _render_full(history, _full_max_chars())
+    return _render_digest(history, _budget())
+
+
 # --------------------------------------------------------------------------
 # hooks
 # --------------------------------------------------------------------------
@@ -174,16 +235,16 @@ def on_pre_llm_call(**kwargs):
     if not session_id or not history:
         return
 
-    digest = _build_digest(history, _budget())
+    rendered = _render(history)
     with _lock:
         if session_id not in _digests and len(_digests) >= _MAX_SESSIONS:
             _digests.pop(next(iter(_digests)))  # FIFO evict oldest session
-        _digests[session_id] = digest
+        _digests[session_id] = rendered
 
 
 def _augment(context, digest: str) -> str:
-    # The header doubles as an idempotency marker: on_pre_tool_call and
-    # _build_digest both look for it to avoid re-embedding an existing digest.
+    # The header doubles as an idempotency marker: on_pre_tool_call and the
+    # renderers both look for it to avoid re-embedding an existing injection.
     prefix = f"{INJECT_HEADER}\n{digest}"
     if context:
         return f"{prefix}\n\n[task context from parent agent]\n{context}"
@@ -191,7 +252,7 @@ def _augment(context, digest: str) -> str:
 
 
 def on_pre_tool_call(**kwargs):
-    """Rewrite delegate_task args to carry the parent digest by default."""
+    """Rewrite delegate_task args to carry the parent context by default."""
     if _disabled():
         return
     if kwargs.get("tool_name") != "delegate_task":
