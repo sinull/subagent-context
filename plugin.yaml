@@ -1,0 +1,8 @@
+name: subagent-context
+version: 1.0.0
+description: >
+  Inject a bounded digest of the parent agent's conversation into every
+  delegate_task child's context by default (single-task and batch forms).
+provides_hooks:
+- pre_llm_call
+- pre_tool_call
